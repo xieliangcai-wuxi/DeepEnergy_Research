@@ -1,0 +1,17 @@
+paths:
+  # 请确保这里的文件名和你下载的Kaggle数据一致
+  raw_energy: "./data/raw/energy_dataset.csv"
+  raw_weather: "./data/raw/weather_features.csv"
+  output_dir: "./data/processed/"
+  log_dir: "./logs/"
+
+preprocessing:
+  target_col: "total load actual"
+  cities: 
+    - "Madrid"
+    - "Barcelona"
+    - "Valencia"
+    - "Seville"
+    - "Bilbao"
+  # 严格的切分比例
+  split_ratio: [0.8, 0.1, 0.1]
