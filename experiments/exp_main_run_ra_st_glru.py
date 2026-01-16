@@ -2,80 +2,71 @@ import sys
 import os
 import yaml
 import torch
-from torch.utils.data import DataLoader
+import numpy as np
+import random
+from tqdm import tqdm
 
-# 1. 路径 Hack (确保能导入 src)
+# 添加项目根目录到路径
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from src.data.dataset import PowerDataset
 from src.data.similarity import SimilarityEngine
 from src.models.ra_st_glru import RA_ST_GLRU
 from src.utils.trainer import StandardTrainer
+from src.utils.logger import setup_logger
+from torch.utils.data import DataLoader
+from src.utils.metrics import calculate_metrics
 
-def run():
-    # --- 配置与准备 ---
-    EXP_NAME = "exp_main_ra_st_glru"
-    CONFIG_PATH = "../configs/exp_main_ra_st_glru.yaml"
+def set_seed(seed):
+    """固定所有随机种子，确保实验可复现"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+
+def run_experiment(seed, config, logger):
+    """运行单个种子的完整实验流程"""
+    EXP_NAME = f"Ensemble_Seed_{seed}"
     
-    if not os.path.exists(CONFIG_PATH):
-        raise FileNotFoundError(f"配置文件未找到: {CONFIG_PATH}")
-        
-    with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
-        config = yaml.safe_load(f)
-        
-    print(f">>> 启动实验: {EXP_NAME}")
+    # 1. 设置种子
+    set_seed(seed)
+    logger.info(f"启动实验子任务: {EXP_NAME} ...")
+
+    # 2. 初始化 Similarity Engine
+    sim_engine = SimilarityEngine(config)
     
-    # --- 步骤 1: 准备 Similarity Engine ---
-    # 如果启用检索，先要在训练集上 fit 权重
-    sim_engine = None
-    if config['model']['use_retrieval']:
-        print("[1/4] 初始化相似日检索引擎...")
-        sim_engine = SimilarityEngine(config)
-        # 临时读取 train.csv 获取列名用于 fit
-        import pandas as pd
-        train_df = pd.read_csv(os.path.join(config['paths']['output_dir'], "train.csv"))
-        # 排除非数值列
-        numeric_cols = [c for c in train_df.columns if "weather_main" not in c and "description" not in c and "time" != c]
-        sim_engine.fit(train_df, numeric_cols)
-    
-    # --- 步骤 2: 准备 Datasets ---
-    print("[2/4] 加载数据集 (Train/Val/Test)...")
+    # 3. 数据集
+    logger.info(f"[Seed {seed}] Loading Datasets...")
     train_ds = PowerDataset(config, mode='train', similarity_engine=sim_engine)
     val_ds = PowerDataset(config, mode='val', similarity_engine=sim_engine)
     test_ds = PowerDataset(config, mode='test', similarity_engine=sim_engine)
     
-    train_loader = DataLoader(train_ds, batch_size=config['train']['batch_size'], shuffle=True, drop_last=True)
+    train_loader = DataLoader(train_ds, batch_size=config['train']['batch_size'], shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=config['train']['batch_size'], shuffle=False)
     test_loader = DataLoader(test_ds, batch_size=config['train']['batch_size'], shuffle=False)
     
-    # --- 步骤 3: 初始化模型 ---
-    print("[3/4] 构建 RA-ST-GLRU 模型...")
+    # 4. 模型初始化 (自动检测维度)
+    # [修复] 正确的解包逻辑
+    # Dataset 返回结构: ((x_num, x_text), x_sim, y)
+    full_sample = train_ds[0] 
+    (x_num, x_text), x_sim, y = full_sample
     
-    # [关键] 动态获取输入维度，防止配置错误
-    # 从 Dataset 中获取一个样本，查看 numerical input 的 shape
-    sample_input, _, _ = train_ds[0]
-    sample_num, _ = sample_input
-    real_in_features = sample_num.shape[-1]
-    
-    print(f"   >>> 检测到输入特征维度: {real_in_features}")
+    in_features = x_num.shape[-1]
+    logger.info(f"[Seed {seed}] Detected input features: {in_features}")
     
     model = RA_ST_GLRU(
-        num_nodes=len(config['preprocessing']['cities']), # 5
-        in_features=real_in_features,                     # 自动检测
+        num_nodes=5,
+        in_features=in_features,
         d_model=config['model']['d_model'],
         layers=config['model']['layers'],
         out_len=config['model']['out_len'],
         top_k=config['model']['top_k'],
         use_retrieval=config['model']['use_retrieval'],
-        dropout=config['model'].get('dropout', 0.1) # 读取配置
+        dropout=config['model'].get('dropout', 0.1)
     )
     
-    # 打印模型参数量
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"   >>> 模型参数量: {total_params / 1e6:.2f} M")
-    
-    # --- 步骤 4: 训练 ---
-    print("[4/4] 开始训练...")
+    # 5. 训练
     trainer = StandardTrainer(
         model=model,
         train_loader=train_loader,
@@ -86,7 +77,97 @@ def run():
     )
     
     trainer.fit()
-    print(">>> 实验结束.")
+    
+    # 6. 加载最优模型并生成预测结果
+    logger.info(f"[Seed {seed}] Generating Predictions using Best Model...")
+    best_model_path = os.path.join(config['paths']['result_dir'], EXP_NAME, "best_model.pth")
+    
+    if not os.path.exists(best_model_path):
+        logger.error(f"[Seed {seed}] Model file not found: {best_model_path}")
+        return None, None
+
+    model.load_state_dict(torch.load(best_model_path))
+    model.eval()
+    
+    all_preds = []
+    all_trues = []
+    
+    # 获取反归一化参数
+    target_mean = trainer.target_mean
+    target_std = trainer.target_std
+    
+    with torch.no_grad():
+        for batch in tqdm(test_loader, desc=f"Predicting Seed {seed}", leave=False):
+            (x_num, x_text), x_sim, y = batch
+            x_num = x_num.to(trainer.device, dtype=torch.float32)
+            x_text = x_text.to(trainer.device, dtype=torch.float32)
+            x_sim = x_sim.to(trainer.device, dtype=torch.float32)
+            
+            # 预测
+            preds = model((x_num, x_text), x_sim) # [Batch, Out_Len, 1]
+            
+            # 反归一化
+            preds_real = preds.cpu().numpy() * target_std + target_mean
+            y_real = y.numpy() * target_std + target_mean
+            
+            all_preds.append(preds_real)
+            all_trues.append(y_real)
+            
+    # [Total_Samples, Out_Len, 1]
+    final_preds = np.concatenate(all_preds, axis=0)
+    final_trues = np.concatenate(all_trues, axis=0)
+    
+    return final_preds, final_trues
 
 if __name__ == "__main__":
-    run()
+    # 1. 加载配置
+    CONFIG_PATH = '../configs/exp_main_ra_st_glru.yaml'
+    with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+        config = yaml.safe_load(f)
+
+    # 2. 初始化主日志记录器
+    main_logger = setup_logger(config['paths']['log_dir'], "Ensemble_Main")
+    
+    main_logger.info("="*60)
+    main_logger.info(">>> STARTING ENSEMBLE EXPERIMENT")
+    main_logger.info("="*60)
+
+    # 定义要运行的种子列表
+    SEEDS = [42, 2024, 1234, 777, 999]
+    
+    ensemble_preds = []
+    ground_truth = None
+    
+    # 3. 循环运行实验
+    for seed in SEEDS:
+        main_logger.info(f"\n>>> Running for Seed: {seed}")
+        try:
+            preds, trues = run_experiment(seed, config, main_logger)
+            if preds is not None:
+                ensemble_preds.append(preds)
+                if ground_truth is None:
+                    ground_truth = trues
+            else:
+                main_logger.warning(f"Seed {seed} failed to produce predictions.")
+        except Exception as e:
+            main_logger.exception(f"Error occurred during seed {seed}: {str(e)}")
+            
+    # 4. 计算集成平均 (Model Averaging)
+    if not ensemble_preds:
+        main_logger.error("No predictions collected. Ensemble failed.")
+        exit(1)
+
+    # Stack: [5, N, 24, 1] -> Mean -> [N, 24, 1]
+    avg_preds = np.mean(ensemble_preds, axis=0)
+    
+    main_logger.info("\n" + "="*40)
+    main_logger.info(">>> ENSEMBLE RESULTS (Average of 5 Runs)")
+    main_logger.info("="*40)
+    
+    # 5. 计算并记录指标
+    metrics = calculate_metrics(avg_preds.flatten(), ground_truth.flatten())
+    
+    main_logger.info(f"Final Ensemble MAE:  {metrics['mae']:.2f} MW")
+    main_logger.info(f"Final Ensemble RMSE: {metrics['rmse']:.2f} MW")
+    main_logger.info(f"Final Ensemble MAPE: {metrics['mape']:.2f} %")
+    main_logger.info("="*40)

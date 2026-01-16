@@ -13,7 +13,7 @@ preprocessing:
 model:
   seq_len: 168     # 保持 168，这是成功的关键
   out_len: 24
-  top_k: 3
+  top_k: 5
   use_retrieval: True
   
   # [调整] 

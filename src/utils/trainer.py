@@ -42,7 +42,7 @@ class StandardTrainer:
             self.optimizer, mode='min', factor=0.5, patience=3
         )
         
-        self.criterion = nn.MSELoss()
+        self.criterion = nn.SmoothL1Loss(beta=1.0)
         self.patience = int(config['train']['patience'])
         self.best_val_loss = float('inf')
         self.patience_counter = 0
