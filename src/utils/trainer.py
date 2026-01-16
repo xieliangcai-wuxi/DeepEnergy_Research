@@ -9,9 +9,10 @@ from .metrics import calculate_metrics
 class StandardTrainer:
     """
     [科研工具] 标准训练器
-    
     Update Log:
-    - [Feature]: 加入反归一化 (Denormalization) 逻辑，确保输出的 MAE/RMSE/MAPE 是真实的物理量(MW)。
+    - [Fix]: 移除了 ReduceLROnPlateau 中的 verbose=True 参数，适配 PyTorch 最新版本。
+    - [Feature]: 加入 LR Scheduler，当 Val Loss 不降时自动减小学习率。
+    - [Feature]: 加入反归一化 (Denormalization) 逻辑。
     """
     def __init__(self, model, train_loader, val_loader, test_loader, config, experiment_name):
         self.config = config
@@ -22,10 +23,9 @@ class StandardTrainer:
         self.test_loader = test_loader
         self.experiment_name = experiment_name
         
-        # 路径设置
+        # 路径与日志
         self.result_dir = os.path.join(config['paths']['result_dir'], experiment_name)
         os.makedirs(self.result_dir, exist_ok=True)
-        
         self.logger = setup_logger(config['paths']['log_dir'], f"{experiment_name}_train")
         
         # 强制类型转换
@@ -33,28 +33,30 @@ class StandardTrainer:
         weight_decay = float(config['train']['weight_decay'])
         
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=weight_decay)
-        self.criterion = nn.MSELoss()
         
+        # [关键修改] 初始化学习率调度器 (移除了 verbose=True)
+        # mode='min': 当 loss 不再下降时触发
+        # factor=0.5: 学习率减半
+        # patience=3: 容忍 3 个 Epoch 不降
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode='min', factor=0.5, patience=3
+        )
+        
+        self.criterion = nn.MSELoss()
         self.patience = int(config['train']['patience'])
         self.best_val_loss = float('inf')
         self.patience_counter = 0
 
-        # [关键] 获取反归一化参数
-        # 我们需要从 train_loader 的 dataset 中提取 target 列的 mean 和 std
-        # 这是一个 Trick: 我们直接访问 dataset 的 scaler
-        # 注意: 这里假设 dataset 使用了 StandardScaler 且 target 是其中的一列
+        # 反归一化参数提取
         try:
             scaler = self.train_loader.dataset.scaler
-            # 获取 target 列的索引
             target_col_name = config['preprocessing']['target_col']
             numeric_cols = self.train_loader.dataset.numeric_cols
             target_idx = numeric_cols.index(target_col_name)
-            
             self.target_mean = scaler.mean_[target_idx]
             self.target_std = scaler.scale_[target_idx]
-            self.logger.info(f"反归一化参数加载成功: Mean={self.target_mean:.4f}, Std={self.target_std:.4f}")
-        except Exception as e:
-            self.logger.warning(f"无法加载反归一化参数，指标将基于归一化数值计算: {e}")
+            self.logger.info(f"反归一化参数: Mean={self.target_mean:.2f}, Std={self.target_std:.2f}")
+        except Exception:
             self.target_mean = 0
             self.target_std = 1
 
@@ -67,8 +69,6 @@ class StandardTrainer:
         return (x_num, x_text), x_sim, y
 
     def _denormalize(self, tensor):
-        """将归一化的张量还原为真实物理值"""
-        # y_real = y_norm * std + mean
         return tensor * self.target_std + self.target_mean
 
     def train_epoch(self):
@@ -80,7 +80,7 @@ class StandardTrainer:
             self.optimizer.zero_grad()
             inputs, x_sim, y = self._process_batch(batch)
             preds = self.model(inputs, x_sim)
-            loss = self.criterion(preds, y) # Loss 依然在归一化空间计算，利于梯度下降
+            loss = self.criterion(preds, y)
             
             if torch.isnan(loss):
                 raise ValueError("Loss is NaN.")
@@ -103,17 +103,14 @@ class StandardTrainer:
             for batch in tqdm(loader, leave=False, desc=mode):
                 inputs, x_sim, y = self._process_batch(batch)
                 preds = self.model(inputs, x_sim)
-                loss = self.criterion(preds, y) # Val Loss 保持归一化空间，用于 Early Stopping
+                loss = self.criterion(preds, y)
                 total_loss += loss.item()
                 
-                # [关键] 反归一化后再存入列表，用于计算 MAE/MAPE
                 pred_real = self._denormalize(preds)
                 y_real = self._denormalize(y)
-                
                 all_preds.append(pred_real.cpu().numpy())
                 all_trues.append(y_real.cpu().numpy())
                 
-        # 计算物理指标
         if len(all_preds) > 0:
             preds_concat = np.concatenate(all_preds, axis=0)
             trues_concat = np.concatenate(all_trues, axis=0)
@@ -131,12 +128,17 @@ class StandardTrainer:
             train_loss = self.train_epoch()
             val_loss, val_metrics = self.evaluate(self.val_loader, "Val")
             
+            # [Scheduler Step]
+            # 更新学习率 (基于 Validation Loss)
+            self.scheduler.step(val_loss)
+            
+            # 手动获取当前 LR 用于打印
+            current_lr = self.optimizer.param_groups[0]['lr']
+
             self.logger.info(
-                f"Epoch {epoch+1:03d} | "
-                f"Train Loss: {train_loss:.4f} | "
-                f"Val Loss: {val_loss:.4f} | "
-                f"Real MAE: {val_metrics['mae']:.2f} MW | "  # 显示单位 MW
-                f"Real MAPE: {val_metrics['mape']:.2f}%"     # 显示百分比
+                f"Epoch {epoch+1:03d} | LR: {current_lr:.6f} | "
+                f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
+                f"Real MAE: {val_metrics['mae']:.2f} MW | Real MAPE: {val_metrics['mape']:.2f}%"
             )
             
             if val_loss < self.best_val_loss:
@@ -149,11 +151,13 @@ class StandardTrainer:
                     self.logger.info("Early Stopping Triggered.")
                     break
         
+        # Final Test
         if os.path.exists(os.path.join(self.result_dir, "best_model.pth")):
+            self.logger.info(">>> Loading best model for testing...")
             self.model.load_state_dict(torch.load(os.path.join(self.result_dir, "best_model.pth")))
             _, test_metrics = self.evaluate(self.test_loader, "Test")
             self.logger.info("="*30)
-            self.logger.info(f"FINAL TEST (Real World Metrics):")
+            self.logger.info(f"FINAL TEST RESULT:")
             self.logger.info(f"MAE:  {test_metrics['mae']:.2f} MW")
             self.logger.info(f"RMSE: {test_metrics['rmse']:.2f} MW")
             self.logger.info(f"MAPE: {test_metrics['mape']:.2f} %")
