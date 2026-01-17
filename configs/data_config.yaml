@@ -9,7 +9,7 @@ preprocessing:
   target_col: "total load actual"
   cities: 
     - "Madrid"
-    - "Barcelona"
+    - " Barcelona"
     - "Valencia"
     - "Seville"
     - "Bilbao"
