@@ -133,7 +133,7 @@ if __name__ == "__main__":
     main_logger.info("="*60)
 
     # 定义要运行的种子列表
-    SEEDS = [42, 2024, 1234, 777, 999]
+    SEEDS = [111,999]
     
     ensemble_preds = []
     ground_truth = None
