@@ -1,9 +1,9 @@
 paths:
   # 请确保这里的文件名和你下载的Kaggle数据一致
-  raw_energy: "./data/raw/energy_dataset.csv"
-  raw_weather: "./data/raw/weather_features.csv"
-  output_dir: "./data/processed/"
-  log_dir: "./logs/"
+  raw_energy: "../data/raw/energy_dataset.csv"
+  raw_weather: "../data/raw/weather_features.csv"
+  output_dir: "../data/processed/"
+  log_dir: "../logs/"
 
 preprocessing:
   target_col: "total load actual"

@@ -1,164 +1,172 @@
 import torch
 import torch.nn as nn
+import torch.optim as optim
 import os
 import numpy as np
-from tqdm import tqdm
+import time
 from .logger import setup_logger
-from .metrics import calculate_metrics
 
 class StandardTrainer:
     """
-    [科研工具] 标准训练器
-    Update Log:
-    - [Fix]: 移除了 ReduceLROnPlateau 中的 verbose=True 参数，适配 PyTorch 最新版本。
-    - [Feature]: 加入 LR Scheduler，当 Val Loss 不降时自动减小学习率。
-    - [Feature]: 加入反归一化 (Denormalization) 逻辑。
+    [StandardTrainer] SOTA-Ready Trainer
+    修复: 强制 weight_decay 类型转换，防止 YAML 解析错误
     """
     def __init__(self, model, train_loader, val_loader, test_loader, config, experiment_name):
-        self.config = config
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = model.to(self.device)
+        self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.test_loader = test_loader
-        self.experiment_name = experiment_name
+        self.config = config
+        self.exp_name = experiment_name
         
-        # 路径与日志
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model.to(self.device)
+        
+        # 结果保存路径
         self.result_dir = os.path.join(config['paths']['result_dir'], experiment_name)
-        os.makedirs(self.result_dir, exist_ok=True)
-        self.logger = setup_logger(config['paths']['log_dir'], f"{experiment_name}_train")
+        if not os.path.exists(self.result_dir): os.makedirs(self.result_dir)
         
-        # 强制类型转换
-        lr = float(config['train']['learning_rate'])
-        weight_decay = float(config['train']['weight_decay'])
+        self.logger = setup_logger(self.result_dir, "training_log")
+        self.criterion = nn.MSELoss() 
         
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=weight_decay)
+        self._setup_optimization()
+
+    def _setup_optimization(self):
+        # 1. 获取参数并强制转为 float
+        lr = float(self.config['train']['learning_rate'])
         
-        # [关键修改] 初始化学习率调度器 (移除了 verbose=True)
-        # mode='min': 当 loss 不再下降时触发
-        # factor=0.5: 学习率减半
-        # patience=3: 容忍 3 个 Epoch 不降
-        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode='min', factor=0.5, patience=3
+        # [Fix] 这里加了 float()，无论 yaml 里写的是 "1e-3" 还是 1e-3，都能变回数字
+        wd = float(self.config['train'].get('weight_decay', 1e-3))
+        
+        # 2. 定义优化器 AdamW
+        self.optimizer = optim.AdamW(
+            self.model.parameters(),
+            lr=lr,
+            weight_decay=wd
         )
         
-        self.criterion = nn.SmoothL1Loss(beta=1.0)
-        self.patience = int(config['train']['patience'])
-        self.best_val_loss = float('inf')
-        self.patience_counter = 0
-
-        # 反归一化参数提取
-        try:
-            scaler = self.train_loader.dataset.scaler
-            target_col_name = config['preprocessing']['target_col']
-            numeric_cols = self.train_loader.dataset.numeric_cols
-            target_idx = numeric_cols.index(target_col_name)
-            self.target_mean = scaler.mean_[target_idx]
-            self.target_std = scaler.scale_[target_idx]
-            self.logger.info(f"反归一化参数: Mean={self.target_mean:.2f}, Std={self.target_std:.2f}")
-        except Exception:
-            self.target_mean = 0
-            self.target_std = 1
-
-    def _process_batch(self, batch):
-        (x_num, x_text), x_sim, y = batch
-        x_num = x_num.to(self.device, dtype=torch.float32)
-        x_text = x_text.to(self.device, dtype=torch.float32)
-        x_sim = x_sim.to(self.device, dtype=torch.float32)
-        y = y.to(self.device, dtype=torch.float32)
-        return (x_num, x_text), x_sim, y
-
-    def _denormalize(self, tensor):
-        return tensor * self.target_std + self.target_mean
-
-    def train_epoch(self):
-        self.model.train()
-        total_loss = 0
-        loop = tqdm(self.train_loader, leave=False, desc="Train")
+        # 3. Cosine 退火调度器
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, 
+            T_max=self.config['train']['epochs'], 
+            eta_min=1e-6
+        )
         
-        for batch in loop:
-            self.optimizer.zero_grad()
-            inputs, x_sim, y = self._process_batch(batch)
-            preds = self.model(inputs, x_sim)
-            loss = self.criterion(preds, y)
-            
-            if torch.isnan(loss):
-                raise ValueError("Loss is NaN.")
-            
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
-            self.optimizer.step()
-            total_loss += loss.item()
-            loop.set_postfix(loss=loss.item())
-            
-        return total_loss / len(self.train_loader)
+        self.logger.info(f"Optimizer: AdamW (LR={lr}, WD={wd})")
 
-    def evaluate(self, loader, mode="Val"):
+    def fit(self):
+        best_val_loss = float('inf')
+        patience_counter = 0
+        patience = self.config['train']['patience']
+        epochs = self.config['train']['epochs']
+        
+        # 获取反归一化参数
+        scaler = self.train_loader.dataset.scaler
+        target_col = self.config['preprocessing']['target_col']
+        num_cols = self.train_loader.dataset.numeric_cols
+        
+        if target_col in num_cols:
+            target_idx = num_cols.index(target_col)
+            self.target_std = scaler.scale_[target_idx]
+            self.target_mean = scaler.mean_[target_idx]
+        else:
+            self.target_std = 1.0; self.target_mean = 0.0
+
+        self.logger.info(f"开始训练 {epochs} Epochs...")
+        
+        for epoch in range(epochs):
+            start_time = time.time()
+            
+            # --- Train ---
+            self.model.train()
+            train_losses = []
+            
+            for batch in self.train_loader:
+                (x_num, x_text), x_sim, y = batch
+                x_num = x_num.to(self.device, dtype=torch.float32)
+                x_text = x_text.to(self.device, dtype=torch.float32)
+                x_sim = x_sim.to(self.device, dtype=torch.float32)
+                y = y.to(self.device, dtype=torch.float32)
+                
+                self.optimizer.zero_grad()
+                pred = self.model((x_num, x_text), x_sim)
+                loss = self.criterion(pred, y)
+                loss.backward()
+                
+                # 梯度裁剪 (防止梯度爆炸)
+                nn.utils.clip_grad_norm_(self.model.parameters(), self.config['train'].get('clip_grad', 5.0))
+                
+                self.optimizer.step()
+                train_losses.append(loss.item())
+            
+            train_loss = np.mean(train_losses)
+            
+            # --- Val ---
+            val_loss, real_mae, real_mape = self._validate()
+            
+            # --- Scheduler ---
+            current_lr = self.optimizer.param_groups[0]['lr']
+            self.scheduler.step()
+            
+            # --- Log ---
+            self.logger.info(
+                f"Epoch {epoch+1:03d} | LR: {current_lr:.6f} | "
+                f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
+                f"Real MAE: {real_mae:.2f} MW | Real MAPE: {real_mape:.2f}%"
+            )
+            
+            # --- Checkpoint ---
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience_counter = 0
+                torch.save(self.model.state_dict(), os.path.join(self.result_dir, "best_model.pth"))
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    self.logger.info("Early Stopping Triggered.")
+                    break
+                    
+        self.logger.info(">>> Loading best model for testing...")
+        self.model.load_state_dict(torch.load(os.path.join(self.result_dir, "best_model.pth")))
+        
+        # Final Test
+        val_loss, final_mae, final_mape = self._validate()
+        self.logger.info("="*30)
+        self.logger.info("FINAL TEST RESULT:")
+        self.logger.info(f"MAE:  {final_mae:.2f} MW")
+        self.logger.info(f"RMSE: {np.sqrt(val_loss) * self.target_std:.2f} MW")
+        self.logger.info(f"MAPE: {final_mape:.2f} %")
+        self.logger.info("="*30)
+
+    def _validate(self):
         self.model.eval()
-        total_loss = 0
+        val_losses = []
         all_preds = []
         all_trues = []
         
         with torch.no_grad():
-            for batch in tqdm(loader, leave=False, desc=mode):
-                inputs, x_sim, y = self._process_batch(batch)
-                preds = self.model(inputs, x_sim)
-                loss = self.criterion(preds, y)
-                total_loss += loss.item()
+            for batch in self.val_loader:
+                (x_num, x_text), x_sim, y = batch
+                x_num = x_num.to(self.device, dtype=torch.float32)
+                x_text = x_text.to(self.device, dtype=torch.float32)
+                x_sim = x_sim.to(self.device, dtype=torch.float32)
+                y = y.to(self.device, dtype=torch.float32)
                 
-                pred_real = self._denormalize(preds)
-                y_real = self._denormalize(y)
-                all_preds.append(pred_real.cpu().numpy())
-                all_trues.append(y_real.cpu().numpy())
+                pred = self.model((x_num, x_text), x_sim)
+                loss = self.criterion(pred, y)
+                val_losses.append(loss.item())
                 
-        if len(all_preds) > 0:
-            preds_concat = np.concatenate(all_preds, axis=0)
-            trues_concat = np.concatenate(all_trues, axis=0)
-            metrics = calculate_metrics(preds_concat.flatten(), trues_concat.flatten())
-        else:
-            metrics = {"mae": 0.0, "rmse": 0.0, "mape": 0.0}
+                pred_real = pred.cpu().numpy() * self.target_std + self.target_mean
+                y_real = y.cpu().numpy() * self.target_std + self.target_mean
+                all_preds.append(pred_real)
+                all_trues.append(y_real)
+                
+        val_loss = np.mean(val_losses)
         
-        return total_loss / len(loader), metrics
-
-    def fit(self):
-        epochs = int(self.config['train']['epochs'])
-        self.logger.info(f"开始训练 {epochs} Epochs...")
+        preds_arr = np.concatenate(all_preds).flatten()
+        trues_arr = np.concatenate(all_trues).flatten()
         
-        for epoch in range(epochs):
-            train_loss = self.train_epoch()
-            val_loss, val_metrics = self.evaluate(self.val_loader, "Val")
-            
-            # [Scheduler Step]
-            # 更新学习率 (基于 Validation Loss)
-            self.scheduler.step(val_loss)
-            
-            # 手动获取当前 LR 用于打印
-            current_lr = self.optimizer.param_groups[0]['lr']
-
-            self.logger.info(
-                f"Epoch {epoch+1:03d} | LR: {current_lr:.6f} | "
-                f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-                f"Real MAE: {val_metrics['mae']:.2f} MW | Real MAPE: {val_metrics['mape']:.2f}%"
-            )
-            
-            if val_loss < self.best_val_loss:
-                self.best_val_loss = val_loss
-                self.patience_counter = 0
-                torch.save(self.model.state_dict(), os.path.join(self.result_dir, "best_model.pth"))
-            else:
-                self.patience_counter += 1
-                if self.patience_counter >= self.patience:
-                    self.logger.info("Early Stopping Triggered.")
-                    break
+        mae = np.mean(np.abs(preds_arr - trues_arr))
+        mape = np.mean(np.abs((preds_arr - trues_arr) / (trues_arr + 1e-5))) * 100
         
-        # Final Test
-        if os.path.exists(os.path.join(self.result_dir, "best_model.pth")):
-            self.logger.info(">>> Loading best model for testing...")
-            self.model.load_state_dict(torch.load(os.path.join(self.result_dir, "best_model.pth")))
-            _, test_metrics = self.evaluate(self.test_loader, "Test")
-            self.logger.info("="*30)
-            self.logger.info(f"FINAL TEST RESULT:")
-            self.logger.info(f"MAE:  {test_metrics['mae']:.2f} MW")
-            self.logger.info(f"RMSE: {test_metrics['rmse']:.2f} MW")
-            self.logger.info(f"MAPE: {test_metrics['mape']:.2f} %")
-            self.logger.info("="*30)
+        return val_loss, mae, mape
