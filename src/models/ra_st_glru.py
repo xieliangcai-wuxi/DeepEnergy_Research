@@ -77,22 +77,21 @@ class RA_ST_GLRU(nn.Module):
 
     def _zero_init_head(self):
         """
-        [修正版] 零初始化策略 v2
-        目标：保持初始 Loss 低 (4.19%)，同时保证梯度畅通。
+        [修正版 v3] 微扰初始化 (Near-Zero Init)
+        目标：Output ≈ 0 (稳住起跑线)，但 Weight != 0 (打通梯度通路)。
         """
-        print("⚡ [Init] Applying Zero-Initialization (Gradient-Friendly Version)...")
+        print("⚡ [Init] Applying Near-Zero Initialization (Gradient Flow Fix)...")
         
-        # 1. 残差内容层：必须全 0
-        # 这样 Neural Output = 0
-        nn.init.zeros_(self.output_head[-1].weight)
-        nn.init.zeros_(self.output_head[-1].bias)
+        # 1. 残差内容层：使用极小的随机数，而不是全 0
+        # std=1e-3 意味着输出在 ±0.00x 级别，对总负荷(30000)的影响微乎其微
+        # 但它保证了梯度可以传回 GLRU！
+        nn.init.normal_(self.output_head[-1].weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.output_head[-1].bias) # Bias 可以是 0
         
-        # 2. Gate 层：Bias 设为 0 (关键修改！)
-        # 之前是 -5.0 (导致梯度消失)
-        # 现在是 0.0 -> Sigmoid(0) = 0.5 -> 梯度最大！
-        # 初始状态: Final = Shortcut + 0.5 * 0 = Shortcut (依然稳！)
-        nn.init.xavier_uniform_(self.confidence_gate[-2].weight) # 权重保持随机，打破对称性
-        nn.init.zeros_(self.confidence_gate[-2].bias) # Bias 设为 0
+        # 2. Gate 层：Bias 设为 0 (Gate=0.5)
+        # 保持 Gate 通畅，让模型一半信 Shortcut，一半信神经网络（虽然一开始是噪声）
+        nn.init.xavier_uniform_(self.confidence_gate[-2].weight) 
+        nn.init.zeros_(self.confidence_gate[-2].bias)
 
     def forward(self, x_current, x_sim, debug=False):
         (x_num, x_text) = x_current
