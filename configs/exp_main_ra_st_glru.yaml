@@ -19,15 +19,15 @@ model:
   seq_len: 336
   out_len: 24
   in_features: 44
-  d_model: 64           # MLP 需要适中的宽度
+  d_model: 64
   layers: 2
   top_k: 8
   use_retrieval: True
-  dropout: 0.3          # 适中正则
+  dropout: 0.2          # 🚨 回调到 0.2，因为 RevIN 本身就有很好的泛化能力
 
 train:
-  batch_size: 64        # 稳定梯度
+  batch_size: 64
   epochs: 100
-  learning_rate: 0.0003 # 稍微给 MLP 多一点动力
-  weight_decay: 1e-3
+  learning_rate: 0.0008 # 可以稍微大一点了
+  weight_decay: 1e-4
   patience: 25

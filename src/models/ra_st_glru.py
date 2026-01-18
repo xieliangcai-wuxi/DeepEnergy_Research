@@ -2,31 +2,20 @@ import torch
 import torch.nn as nn
 from .glru import GLRU
 from .retrieval_attention import RetrievalAttention
+from .revin import RevIN
 
 class RA_ST_GLRU(nn.Module):
-    """
-    [Logic Audit] 
-    Architecture: Residual Time-Series Network
-    Flow: 
-      1. Input (History) -> Lag-24 Baseline (Shortcut)
-      2. Input (History) -> GLRU + Retrieval -> Residual Correction (Main Branch)
-      3. Output = Baseline + Residual
-    """
     def __init__(self, num_nodes, in_features, d_model, layers, out_len, top_k, target_idx, use_retrieval=True, dropout=0.1):
         super().__init__()
         
-        # --- 参数校验 ---
         self.d_model = d_model
         self.out_len = out_len
         self.target_idx = target_idx
         self.in_features = in_features
         self.use_retrieval = use_retrieval
         
-        if target_idx >= in_features:
-            raise ValueError(f"Target Index {target_idx} out of bounds for features {in_features}")
+        self.revin = RevIN(in_features)
 
-        # --- 1. 编码层 (Projections) ---
-        # 为什么是 +768? 因为 BERT embedding 是 768 维
         self.input_proj_current = nn.Sequential(
             nn.Linear(in_features + 768, d_model),
             nn.LayerNorm(d_model),
@@ -40,13 +29,10 @@ class RA_ST_GLRU(nn.Module):
                 nn.Dropout(dropout)
             )
 
-        # --- 2. 时序骨干 (Backbone) ---
-        # 使用 ModuleList 以便后续扩展或检查
         self.glru_layers = nn.ModuleList([
             GLRU(d_model, dropout) for _ in range(layers)
         ])
         
-        # --- 3. 检索增强 (Retrieval) ---
         if self.use_retrieval:
             self.retrieval_attn = RetrievalAttention(d_model, top_k, dropout)
             self.fusion_gate = nn.Sequential(
@@ -54,97 +40,102 @@ class RA_ST_GLRU(nn.Module):
                 nn.Sigmoid() 
             )
 
-        # --- 4. 解码头 (Decoder Head) ---
-        # [逻辑升级] 使用 MLP 而不是单层 Linear
-        # 原因：残差与特征的关系是非线性的，MLP 能更好地拟合"误差"
         self.output_head = nn.Sequential(
             nn.Linear(d_model, d_model * 2),
-            nn.GELU(),              # 更好的激活函数
+            nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(d_model * 2, out_len)
         )
 
-    def forward(self, x_current, x_sim):
+    def forward(self, x_current, x_sim, debug=False):
         """
-        Input Flow:
-        x_num: [Batch, Seq, Feat]
-        x_text: [Batch, Seq, 768]
+        完整的前向传播逻辑 (SOTA 严谨版)
+        包含：RevIN -> No Masking -> Neural Net -> Shortcut -> Rigorous Denorm
         """
         (x_num, x_text) = x_current
         
-        # [Check 1] 输入完整性
-        B, Seq, F = x_num.shape
-        if Seq < self.out_len: 
-            raise ValueError(f"Sequence length {Seq} too short for shortcut {self.out_len}")
+        if debug: print("\n🔍 [Model Internals] Start Forward Pass...")
 
         # ==========================================
-        # Branch A: 物理捷径 (Shortcut)
+        # Step 1: RevIN Normalization (安检入口)
         # ==========================================
-        # 逻辑：取 x_num 的最后 24 个时间步的 Target 值。
-        # 含义：假设明天和今天同一时间完全一样 (Persistence Model)。
-        # 形状流向：[B, Seq, F] -> [B, Out_Len]
-        baseline = x_num[:, -self.out_len:, self.target_idx] 
+        # 消除非平稳性。注意：这里包含了 Affine Transform (乘 weight 加 bias)
+        x_num_norm = self.revin(x_num, mode='norm')
         
+        if debug:
+            print(f"   1. Input Norm | Mean: {x_num_norm.mean():.4f} | Std: {x_num_norm.std():.4f}")
+
         # ==========================================
-        # Branch B: 残差预测 (Neural Network)
+        # Step 2: Main Branch (神经网络主路)
         # ==========================================
-        
-        # 1. 融合
-        # [B, Seq, F+768]
-        x_fused = torch.cat([x_num, x_text], dim=-1)
-        
-        # 2. 投影
-        # [B, Seq, d_model]
+        # 🚨 关键：无 Masking！保留完整视力，让模型看到趋势。
+        x_fused = torch.cat([x_num_norm, x_text], dim=-1)
         x_emb = self.input_proj_current(x_fused)
         
-        # 3. GLRU 处理
+        # GLRU 提取时序特征
         h_seq = x_emb
         for layer in self.glru_layers:
             h_seq = layer(h_seq)
-        
-        # 4. 提取上下文 (Last Step)
-        # [B, d_model]
         context = h_seq[:, -1, :] 
         
-        # 5. 检索增强
+        # RAG 检索增强
         if self.use_retrieval:
             b, k, l, f = x_sim.shape
-            # [Check 2] 历史特征维度对齐
-            if f != self.in_features: raise ValueError("Retrieval feature mismatch")
-            
-            # [B*K, L, F] -> [B*K, L, d_model]
-            x_sim_emb = self.input_proj_sim(x_sim.view(b*k, l, f))
-            
-            # Mean Pooling over time (压缩时间维)
-            # [B*K, d_model]
+            x_sim_flat = x_sim.view(b * k, l, f)
+            x_sim_emb = self.input_proj_sim(x_sim_flat)
             x_sim_vec = x_sim_emb.mean(dim=1)
-            
-            # [B, K, d_model]
             keys_values = x_sim_vec.view(b, k, self.d_model)
             
-            # Attention
             retrieval_out = self.retrieval_attn(context.unsqueeze(1), keys_values).squeeze(1)
-            
-            # Gating
             g = self.fusion_gate(torch.cat([context, retrieval_out], dim=-1))
             h_final = context + g * retrieval_out
         else:
             h_final = context
 
-        # 6. 预测残差
-        # [B, d_model] -> [B, out_len]
-        pred_residual = self.output_head(h_final)
-        
+        # MLP Head 预测残差 (在归一化空间下)
+        pred_residual_norm = self.output_head(h_final)
+
         # ==========================================
-        # Merge: Summation
+        # Step 3: Direct Method / Shortcut (物理捷径)
         # ==========================================
+        # 这就是你要找的“直接方法”！
+        # 逻辑：直接截取 normalized input 的最后 24 个点
+        # 意义：假设归一化后的明天 = 归一化后的昨天
+        baseline_norm = x_num_norm[:, -self.out_len:, self.target_idx]
         
-        # [Check 3] 维度严格检查
-        if baseline.shape != pred_residual.shape:
-            raise ValueError(f"Shape Mismatch: Baseline {baseline.shape} vs Residual {pred_residual.shape}")
+        # 融合：捷径 + 残差
+        final_pred_norm = baseline_norm + pred_residual_norm
+        
+        if debug:
+            print(f"   2. Pred(Norm) | Mean: {final_pred_norm.mean():.4f} | Std: {final_pred_norm.std():.4f}")
+
+        # ==========================================
+        # Step 4: RevIN Denormalization (严谨反归一化)
+        # ==========================================
+        # 必须先逆转 Affine，再逆转 Mean/Std
+        
+        # A. 逆转仿射变换 (Reverse Affine)
+        # 公式: x = (x - bias) / weight
+        if self.revin.affine:
+            # 取出 Target 列对应的标量参数
+            target_weight = self.revin.affine_weight[self.target_idx]
+            target_bias = self.revin.affine_bias[self.target_idx]
             
-        # Final = Yesterday + Delta
-        final_pred = baseline + pred_residual
+            # 广播计算 (Batch, 24) - Scalar
+            final_pred_norm = (final_pred_norm - target_bias) / (target_weight + 1e-10)
+
+        # B. 逆转统计量 (Reverse Stats)
+        # 公式: x = x * std + mean
+        # 取出 Target 列对应的统计量 [Batch, 1, F] -> [Batch, 1]
+        target_mean = self.revin.mean[:, :, self.target_idx]
+        target_std = self.revin.stdev[:, :, self.target_idx]
         
-        # [B, out_len, 1] - 增加最后一维以匹配 Label
+        # 广播计算 (Batch, 24) * (Batch, 1)
+        final_pred = final_pred_norm * target_std + target_mean
+        
+        if debug:
+            print(f"   3. Final Output | Mean: {final_pred.mean():.4f} | Std: {final_pred.std():.4f}")
+            print("✅ [Model Internals] Forward Pass Complete.\n")
+
+        # 恢复形状 [Batch, Out_Len, 1]
         return final_pred.unsqueeze(-1)

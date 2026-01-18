@@ -8,8 +8,7 @@ from .logger import setup_logger
 
 class StandardTrainer:
     """
-    [StandardTrainer] SOTA-Ready Trainer
-    修复: 强制 weight_decay 类型转换，防止 YAML 解析错误
+    [StandardTrainer] L1 Loss + Warmup Edition
     """
     def __init__(self, model, train_loader, val_loader, test_loader, config, experiment_name):
         self.model = model
@@ -22,37 +21,45 @@ class StandardTrainer:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model.to(self.device)
         
-        # 结果保存路径
         self.result_dir = os.path.join(config['paths']['result_dir'], experiment_name)
         if not os.path.exists(self.result_dir): os.makedirs(self.result_dir)
         
         self.logger = setup_logger(self.result_dir, "training_log")
-        self.criterion = nn.MSELoss() 
+        
+        # 🚨 [关键修改] 使用 L1Loss (MAE Loss) 而不是 MSE
+        # L1 Loss 对异常值更鲁棒，适合 MAPE 指标
+        self.criterion = nn.L1Loss() 
         
         self._setup_optimization()
 
     def _setup_optimization(self):
-        # 1. 获取参数并强制转为 float
         lr = float(self.config['train']['learning_rate'])
-        
-        # [Fix] 这里加了 float()，无论 yaml 里写的是 "1e-3" 还是 1e-3，都能变回数字
         wd = float(self.config['train'].get('weight_decay', 1e-3))
         
-        # 2. 定义优化器 AdamW
         self.optimizer = optim.AdamW(
             self.model.parameters(),
             lr=lr,
             weight_decay=wd
         )
         
-        # 3. Cosine 退火调度器
-        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, 
-            T_max=self.config['train']['epochs'], 
-            eta_min=1e-6
-        )
+        # 🚨 [关键修改] 引入 Warmup + Cosine Annealing
+        # 前 5 个 Epoch 预热，防止模型一开始就掉进局部最优
+        from torch.optim.lr_scheduler import LambdaLR
         
-        self.logger.info(f"Optimizer: AdamW (LR={lr}, WD={wd})")
+        warmup_epochs = 5
+        max_epochs = self.config['train']['epochs']
+        
+        def lr_lambda(current_step):
+            # Warmup logic
+            if current_step < warmup_epochs:
+                return float(current_step) / float(max(1, warmup_epochs))
+            # Cosine decay logic
+            progress = float(current_step - warmup_epochs) / float(max(1, max_epochs - warmup_epochs))
+            return 0.5 * (1.0 + np.cos(np.pi * progress))
+
+        self.scheduler = LambdaLR(self.optimizer, lr_lambda)
+        
+        self.logger.info(f"Optimizer: AdamW (LR={lr}, WD={wd}) | Loss: L1Loss | Scheduler: Warmup({warmup_epochs}) + Cosine")
 
     def fit(self):
         best_val_loss = float('inf')
@@ -60,11 +67,9 @@ class StandardTrainer:
         patience = self.config['train']['patience']
         epochs = self.config['train']['epochs']
         
-        # 获取反归一化参数
         scaler = self.train_loader.dataset.scaler
         target_col = self.config['preprocessing']['target_col']
         num_cols = self.train_loader.dataset.numeric_cols
-        
         if target_col in num_cols:
             target_idx = num_cols.index(target_col)
             self.target_std = scaler.scale_[target_idx]
@@ -89,24 +94,25 @@ class StandardTrainer:
                 y = y.to(self.device, dtype=torch.float32)
                 
                 self.optimizer.zero_grad()
+                
+                # Forward (Pass debug=False)
                 pred = self.model((x_num, x_text), x_sim)
+                
                 loss = self.criterion(pred, y)
                 loss.backward()
                 
-                # 梯度裁剪 (防止梯度爆炸)
                 nn.utils.clip_grad_norm_(self.model.parameters(), self.config['train'].get('clip_grad', 5.0))
-                
                 self.optimizer.step()
                 train_losses.append(loss.item())
             
             train_loss = np.mean(train_losses)
             
+            # --- Scheduler Step (Per Epoch) ---
+            self.scheduler.step()
+            current_lr = self.optimizer.param_groups[0]['lr']
+            
             # --- Val ---
             val_loss, real_mae, real_mape = self._validate()
-            
-            # --- Scheduler ---
-            current_lr = self.optimizer.param_groups[0]['lr']
-            self.scheduler.step()
             
             # --- Log ---
             self.logger.info(
@@ -116,6 +122,7 @@ class StandardTrainer:
             )
             
             # --- Checkpoint ---
+            # 注意：因为换了 L1Loss，Loss 的数值会变（变大或变小），但这不影响比较逻辑
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 patience_counter = 0
@@ -129,7 +136,6 @@ class StandardTrainer:
         self.logger.info(">>> Loading best model for testing...")
         self.model.load_state_dict(torch.load(os.path.join(self.result_dir, "best_model.pth")))
         
-        # Final Test
         val_loss, final_mae, final_mape = self._validate()
         self.logger.info("="*30)
         self.logger.info("FINAL TEST RESULT:")
@@ -162,7 +168,6 @@ class StandardTrainer:
                 all_trues.append(y_real)
                 
         val_loss = np.mean(val_losses)
-        
         preds_arr = np.concatenate(all_preds).flatten()
         trues_arr = np.concatenate(all_trues).flatten()
         
